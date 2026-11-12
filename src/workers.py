@@ -43,6 +43,7 @@ except ImportError:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TEMPLATES_DIR = PROJECT_ROOT / "templates"
+EXAMPLES_DIR = PROJECT_ROOT / "examples"
 OUTPUT_ROOT = PROJECT_ROOT / "output"
 
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
@@ -214,12 +215,26 @@ def run_pipeline(
     print("=" * 72)
 
     generated_docs: Dict[str, str] = {}
+    golden_patterns_path = EXAMPLES_DIR / "golden_patterns.md"
+    golden_patterns = (
+        golden_patterns_path.read_text(encoding="utf-8")
+        if golden_patterns_path.exists()
+        else ""
+    )
 
     for idx, (template_name, step_instruction) in enumerate(PIPELINE_STEPS, start=1):
         template_path = TEMPLATES_DIR / template_name
         if not template_path.exists():
             print(f"[ERROR] Template missing: {template_path}", file=sys.stderr)
             sys.exit(1)
+
+        full_system_instruction = (
+            f"{step_instruction}\n\n"
+            f"=== GOLDEN BA/SA ARCHITECTURAL PATTERNS (FEW-SHOT REFERENCE) ===\n"
+            f"{golden_patterns}"
+            if golden_patterns
+            else step_instruction
+        )
 
         template_content = (
             template_path.read_text(encoding="utf-8")
@@ -250,7 +265,7 @@ def run_pipeline(
         raw_output = generate_with_retry(
             client=client,
             model_name=model_name,
-            system_instruction=step_instruction,
+            system_instruction=full_system_instruction,
             user_prompt=user_prompt,
             base_delay=max(delay_seconds, 2.0),
         )

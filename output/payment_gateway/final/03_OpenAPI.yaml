@@ -420,6 +420,13 @@ components:
           example: "The bank declined the transaction due to insufficient funds."
         error_code:
           type: string
+          enum:
+            - IDEMPOTENCY_IN_FLIGHT
+            - INSUFFICIENT_FUNDS
+            - CARD_STOLEN
+            - CARD_EXPIRED
+            - REFUND_EXCEEDS_PAYMENT_BALANCE
+            - INVALID_STATE_TRANSITION
           example: "INSUFFICIENT_FUNDS"
         trace_id:
           type: string
