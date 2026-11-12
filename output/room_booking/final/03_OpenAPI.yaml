@@ -1,0 +1,452 @@
+openapi: 3.1.0
+info:
+  title: "Smart Room Booking — Core Service API Specification"
+  version: 1.0.0
+  summary: Enterprise REST API & Webhooks contract for Smart Office Room Booking across multiple timezones.
+  description: |
+    Verified OpenAPI 3.1.0 specification generated and audited by **SA-Spec-Pipeline** (Orchestrator: Gemini 4 Argon).
+    All resource endpoints, request/response schemas, field types, and status enums strictly match
+    the ERD and State Machine in `02_Architecture.md`.
+servers:
+  - url: https://api.booking.company.internal/v1
+    description: Production Internal API Server
+  - url: https://sandbox.api.booking.company.internal/v1
+    description: Staging / Sandbox API Server
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Bookings
+    description: Lifecycle management of meeting room bookings
+  - name: CheckIns
+    description: Presence verification via dynamic TOTP QR code or corporate Office Wi-Fi
+  - name: Webhooks
+    description: Outbound asynchronous event notifications for Calendar Sync (Google Calendar / MS Exchange)
+
+paths:
+  /bookings:
+    post:
+      tags: [Bookings]
+      operationId: createBooking
+      summary: Create a new meeting room booking
+      description: |
+        Creates a booking in `PENDING_CHECKIN` status after enforcing business rules:
+        - `BR-01`: Max 120 minutes duration and max 14 days horizon for standard rooms/employees.
+        - `BR-02`: VIP rooms (`is_vip=true`) require `grade=L8+` or `is_vip_authorized=true` (max 480 minutes).
+        - `BR-03`: Recurring bookings (`is_recurring=true`) are rejected in MVP.
+        - `BR-05`: PostgreSQL GIST exclusion constraint prevents overlapping slots (`409 Conflict`).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBookingRequest"
+      responses:
+        "201":
+          description: Booking created successfully in PENDING_CHECKIN status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /bookings/{booking_id}:
+    get:
+      tags: [Bookings]
+      operationId: getBookingById
+      summary: Retrieve booking details by ID
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200":
+          description: Booking details retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /bookings/{booking_id}/cancel:
+    post:
+      tags: [Bookings]
+      operationId: cancelBooking
+      summary: Cancel an active or pending booking
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelBookingRequest"
+      responses:
+        "200":
+          description: Booking canceled and room slot released immediately
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /check-ins:
+    post:
+      tags: [CheckIns]
+      operationId: performCheckIn
+      summary: Confirm physical presence (Check-in) for a booking
+      description: |
+        Transitions a booking from `PENDING_CHECKIN` to `CONFIRMED` within the check-in window
+        `[start_at - 10 minutes, start_at + 15 minutes]` (`BR-04`).
+        Requires either a valid 30-second rotating `qr_token` from the room tablet (`method=QR_CODE`)
+        or a connection originating from the office corporate Wi-Fi subnet (`method=WIFI`).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCheckInRequest"
+      responses:
+        "201":
+          description: Check-in verified; booking status updated to CONFIRMED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckInResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+webhooks:
+  bookingLifecycleEvent:
+    post:
+      tags: [Webhooks]
+      operationId: onBookingLifecycleEvent
+      summary: Outbound webhook event for calendar synchronization and audit consumers
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 signature of the raw JSON request payload
+          schema:
+            type: string
+            example: "t=1762945200,v1=6f8e9a12b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEventPayload"
+      responses:
+        "200":
+          description: Webhook event acknowledged by calendar sync consumer
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique UUID v4 key to guarantee idempotent execution (TTL 24h)
+      schema:
+        type: string
+        format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+    BookingId:
+      name: booking_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    BookingStatus:
+      type: string
+      description: Must match BOOKING.status in 02_Architecture.md ERD and State Machine
+      enum: [PENDING_CHECKIN, CONFIRMED, COMPLETED, CANCELED, NO_SHOW]
+      example: "PENDING_CHECKIN"
+
+    CheckInMethod:
+      type: string
+      enum: [QR_CODE, WIFI]
+      example: "QR_CODE"
+
+    OfficeTimezone:
+      type: string
+      description: Standard IANA timezone identifier of the office where the room is located
+      enum: ["Europe/Moscow", "Asia/Almaty", "Asia/Tashkent"]
+      example: "Asia/Almaty"
+
+    CreateBookingRequest:
+      type: object
+      required:
+        - room_id
+        - employee_id
+        - title
+        - start_at
+        - end_at
+      properties:
+        room_id:
+          type: string
+          format: uuid
+        employee_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+          example: "Architecture Sync: Billing & Booking"
+        start_at:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp with timezone offset or UTC (inclusive start bound)
+          example: "2026-11-15T10:00:00+05:00"
+        end_at:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp with timezone offset or UTC (exclusive end bound)
+          example: "2026-11-15T11:30:00+05:00"
+        is_recurring:
+          type: boolean
+          default: false
+          description: Must be false in MVP (BR-03); true triggers 422 RECURRING_NOT_SUPPORTED_IN_MVP
+
+    CancelBookingRequest:
+      type: object
+      required:
+        - cancellation_reason
+      properties:
+        cancellation_reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          example: "Meeting rescheduled to next week"
+
+    CreateCheckInRequest:
+      type: object
+      required:
+        - booking_id
+        - employee_id
+        - method
+      properties:
+        booking_id:
+          type: string
+          format: uuid
+        employee_id:
+          type: string
+          format: uuid
+        method:
+          $ref: "#/components/schemas/CheckInMethod"
+        qr_token:
+          type: [string, "null"]
+          minLength: 6
+          maxLength: 64
+          description: Required when method is QR_CODE; rotating 30-second TOTP token displayed on the room tablet
+          example: "849201"
+
+    BookingResponse:
+      type: object
+      required:
+        - id
+        - room_id
+        - employee_id
+        - title
+        - start_at
+        - end_at
+        - office_timezone
+        - status
+        - is_recurring
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        room_id:
+          type: string
+          format: uuid
+        employee_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        start_at:
+          type: string
+          format: date-time
+          description: Canonical UTC timestamp (ISO-8601)
+        end_at:
+          type: string
+          format: date-time
+          description: Canonical UTC timestamp (ISO-8601)
+        office_timezone:
+          $ref: "#/components/schemas/OfficeTimezone"
+        status:
+          $ref: "#/components/schemas/BookingStatus"
+        is_recurring:
+          type: boolean
+        cancellation_reason:
+          type: [string, "null"]
+        version:
+          type: integer
+          minimum: 1
+          description: Optimistic locking version counter
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CheckInResponse:
+      type: object
+      required:
+        - id
+        - booking_id
+        - employee_id
+        - method
+        - booking_status
+        - checked_in_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        booking_id:
+          type: string
+          format: uuid
+        employee_id:
+          type: string
+          format: uuid
+        method:
+          $ref: "#/components/schemas/CheckInMethod"
+        verified_ip:
+          type: [string, "null"]
+          example: "10.24.16.42"
+        booking_status:
+          $ref: "#/components/schemas/BookingStatus"
+        checked_in_at:
+          type: string
+          format: date-time
+
+    WebhookEventPayload:
+      type: object
+      required:
+        - id
+        - event_type
+        - aggregate_id
+        - created_at
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum:
+            - booking.created
+            - booking.confirmed
+            - booking.canceled
+            - booking.no_show
+          example: "booking.confirmed"
+        aggregate_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          additionalProperties: true
+
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://api.booking.company.internal/errors/room-slot-overlap"
+        title:
+          type: string
+          example: "Room Slot Overlap"
+        status:
+          type: integer
+          example: 409
+        detail:
+          type: string
+          example: "The requested time slot [14:00, 15:00) is already reserved for this room."
+        error_code:
+          type: string
+          enum:
+            - IDEMPOTENCY_IN_FLIGHT
+            - ROOM_SLOT_OVERLAP
+            - EXCEEDS_MAX_DURATION
+            - EXCEEDS_BOOKING_HORIZON
+            - RECURRING_NOT_SUPPORTED_IN_MVP
+            - VIP_ACCESS_REQUIRED
+            - CHECKIN_WINDOW_INVALID
+            - INVALID_QR_TOKEN
+            - OFFICE_WIFI_REQUIRED
+            - INVALID_STATE_TRANSITION
+          example: "ROOM_SLOT_OVERLAP"
+        trace_id:
+          type: string
+          example: "trace-77c91e4a02b1"
+
+  responses:
+    BadRequest:
+      description: Malformed JSON syntax or invalid parameter format
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotFound:
+      description: Requested booking or room was not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    Conflict:
+      description: Double booking slot overlap (23P01 GIST exclusion) or Idempotency-Key conflict
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    UnprocessableEntity:
+      description: Domain business rule violation (BR-01..BR-04) or invalid state transition
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

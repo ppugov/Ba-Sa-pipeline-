@@ -1,0 +1,460 @@
+openapi: 3.1.0
+info:
+  title: "bank_kinopoisk — Core Service API Specification"
+  version: 1.0.0
+  summary: REST API & Webhooks contract generated and verified by SA-Spec-Pipeline.
+  description: |
+    Universal OpenAPI 3.1.0 specification template for **SA-Spec-Pipeline**.
+    All resource endpoints, request/response schemas, field types, and status enums
+    MUST strictly match the domain entities and state machine in `02_Architecture.md`.
+servers:
+  - url: https://api.example.com/v1
+    description: Production API Server
+  - url: https://sandbox.api.example.com/v1
+    description: Sandbox / Staging API Server
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: CoreResources
+    description: Управление гибридными платежными сессиями (Saga) и подписками экосистемы
+  - name: Operations
+    description: Операции отмены, компенсации и изменения состояний платежей
+  - name: Webhooks
+    description: Асинхронные уведомления о событиях жизненного цикла доменных агрегатов
+
+paths:
+  /hybrid-payments:
+    post:
+      tags: [CoreResources]
+      operationId: createHybridPaymentSession
+      summary: Создать сессию гибридной оплаты контента (TVOD) с использованием Saga-паттерна
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/HybridPaymentRequest"
+      responses:
+        "201":
+          description: Платежная сессия успешно создана и обработана
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /hybrid-payments/{payment_id}:
+    get:
+      tags: [CoreResources]
+      operationId: getHybridPaymentById
+      summary: Получить детальную информацию о сессии гибридной оплаты по идентификатору
+      parameters:
+        - name: payment_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Данные сессии успешно получены
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /hybrid-payments/{payment_id}/cancel:
+    post:
+      tags: [Operations]
+      operationId: cancelHybridPayment
+      summary: Отменить или запустить компенсаторную транзакцию для сессии гибридной оплаты
+      parameters:
+        - name: payment_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelHybridPaymentRequest"
+      responses:
+        "200":
+          description: Статус платежной сессии успешно обновлен (компенсация выполнена)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /subscriptions/status:
+    put:
+      tags: [CoreResources]
+      operationId: updateSubscriptionStatus
+      summary: Обновить статус подписки и квалифицируемый оборот пользователя (вызывается интеграционным сервисом)
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSubscriptionStatusRequest"
+      responses:
+        "200":
+          description: Статус подписки успешно обновлен
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionStateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+webhooks:
+  domainResourceEvent:
+    post:
+      tags: [Webhooks]
+      operationId: onDomainResourceEvent
+      summary: Исходящий вебхук для уведомления о событиях изменения жизненного цикла агрегатов экосистемы
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 подпись тела запроса
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEventPayload"
+      responses:
+        "200":
+          description: Вебхук успешно принят и обработан потребителем
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Уникальный UUID v4 ключ для гарантии идемпотентности операций (TTL 24ч)
+      schema:
+        type: string
+        format: uuid
+    ResourceId:
+      name: resource_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    HybridPaymentStatus:
+      type: string
+      description: Соответствует состояниям машины состояний Saga в 02_Architecture.md
+      enum: [INITIATED, POINTS_HELD, FUNDS_DEBITED, COMMITTED, COMPENSATED, FAILED]
+
+    SubscriptionStatusEnum:
+      type: string
+      description: Статусы подписки Кинопоиска в рамках экосистемного бандла
+      enum: [FREE_BUNDLE, PAID_399, GRACE_PERIOD, EXPIRED]
+
+    EcosystemUserStatus:
+      type: string
+      description: Статусы аккаунта в экосистеме
+      enum: [ACTIVE, BLOCKED, PENDING_LINK]
+
+    CreateResourceRequest:
+      type: object
+      required: [actor_id, item_id]
+      properties:
+        actor_id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+        scheduled_at:
+          type: [string, "null"]
+          format: date-time
+
+    CancelResourceRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+        immediate:
+          type: boolean
+          default: true
+
+    HybridPaymentRequest:
+      type: object
+      required: [ecosystem_user_id, item_id, total_amount_minor, paid_points_minor, paid_money_minor]
+      properties:
+        ecosystem_user_id:
+          type: string
+          description: Уникальный идентификатор пользователя в экосистеме
+        item_id:
+          type: string
+          format: uuid
+          description: Идентификатор контента (CATALOG_ITEM)
+        total_amount_minor:
+          type: integer
+          minimum: 1
+          description: Общая стоимость контента в минорных единицах (копейках)
+        paid_points_minor:
+          type: integer
+          minimum: 0
+          description: Количество бонусных баллов к списанию (не более 99% от total_amount_minor)
+        paid_money_minor:
+          type: integer
+          minimum: 1
+          description: Сумма к оплате деньгами с карты в минорных единицах (минимум 1% от стоимости)
+        parent_pin_hash:
+          type: [string, "null"]
+          description: Хеш 4-значного родительского ПИН-кода для защиты от детского фрода на Smart TV (>300 RUB)
+
+    CancelHybridPaymentRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+        immediate:
+          type: boolean
+          default: true
+
+    UpdateSubscriptionStatusRequest:
+      type: object
+      required: [ecosystem_user_id, subscription_status, qualified_turnover_minor, spend_target_met, turnover_progress_pct]
+      properties:
+        ecosystem_user_id:
+          type: string
+        subscription_status:
+          $ref: "#/components/schemas/SubscriptionStatusEnum"
+        qualified_turnover_minor:
+          type: integer
+          minimum: 0
+          description: Квалифицируемый оборот по карте за расчетный период в минорных единицах
+        spend_target_met:
+          type: boolean
+          description: Флаг достижения целевого порога трат (>= 15 000 руб.)
+        turnover_progress_pct:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: Процент выполнения целевого оборота
+
+    HybridPaymentSessionResponse:
+      type: object
+      required:
+        - id
+        - ecosystem_user_id
+        - item_id
+        - total_amount_minor
+        - paid_money_minor
+        - paid_points_minor
+        - status
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        ecosystem_user_id:
+          type: string
+        item_id:
+          type: string
+          format: uuid
+        total_amount_minor:
+          type: integer
+        paid_money_minor:
+          type: integer
+        paid_points_minor:
+          type: integer
+        status:
+          $ref: "#/components/schemas/HybridPaymentStatus"
+        parent_pin_hash:
+          type: [string, "null"]
+        version:
+          type: integer
+          minimum: 1
+          description: Версия оптимистичной блокировки
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SubscriptionStateResponse:
+      type: object
+      required:
+        - id
+        - ecosystem_user_id
+        - subscription_status
+        - qualified_turnover_minor
+        - spend_target_met
+        - turnover_progress_pct
+        - period_start
+        - period_end
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        ecosystem_user_id:
+          type: string
+        subscription_status:
+          $ref: "#/components/schemas/SubscriptionStatusEnum"
+        qualified_turnover_minor:
+          type: integer
+        spend_target_met:
+          type: boolean
+        turnover_progress_pct:
+          type: integer
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ResourceResponse:
+      type: object
+      required:
+        - id
+        - actor_id
+        - item_id
+        - status
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        actor_id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+        scheduled_at:
+          type: [string, "null"]
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    WebhookEventPayload:
+      type: object
+      required: [id, event_type, aggregate_id, created_at, data]
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          description: Тип доменного события (например, TurnoverCalculatedEvent, HybridPaymentCommitted)
+        aggregate_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          additionalProperties: true
+
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        error_code:
+          type: string
+        trace_id:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Неверный синтаксис запроса или ошибка валидации параметров
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotFound:
+      description: Запрашиваемый ресурс не найден
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    Conflict:
+      description: Конфликт идемпотентности, параллельной модификации или дублирование состояния ресурса
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    UnprocessableEntity:
+      description: Нарушение бизнес-правила (BR-*) или недопустимый переход состояния
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

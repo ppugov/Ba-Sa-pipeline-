@@ -1,0 +1,458 @@
+openapi: 3.1.0
+info:
+  title: "Payment Gateway Core - Recurring Billing & Subscription API"
+  version: 1.0.0
+  summary: Enterprise API for recurring subscriptions, payment methods, invoices, and refunds.
+  description: |
+    Production-grade OpenAPI 3.1.0 specification verified by **SA-Spec-Pipeline** Orchestrator.
+    All entity attributes, data types, and status enumerations strictly match `02_Architecture.md` ERD.
+servers:
+  - url: https://api.billing.company.internal/v1
+    description: Production Internal Billing Gateway
+  - url: https://sandbox.api.billing.company.internal/v1
+    description: Sandbox Staging Environment
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Subscriptions
+    description: Lifecycle management of customer recurring subscriptions
+  - name: Invoices
+    description: Invoices, payment attempts, and refunds
+  - name: Webhooks
+    description: Outbound signed event notifications sent to Merchant Backend
+
+paths:
+  /subscriptions:
+    post:
+      tags: [Subscriptions]
+      operationId: createSubscription
+      summary: Create a new recurring subscription
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSubscriptionRequest"
+      responses:
+        "201":
+          description: Subscription created successfully and initial payment captured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "402":
+          $ref: "#/components/responses/PaymentFailed"
+        "409":
+          $ref: "#/components/responses/IdempotencyConflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /subscriptions/{subscription_id}:
+    get:
+      tags: [Subscriptions]
+      operationId: getSubscription
+      summary: Retrieve subscription details by ID
+      parameters:
+        - $ref: "#/components/parameters/SubscriptionId"
+      responses:
+        "200":
+          description: Subscription details retrieved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /subscriptions/{subscription_id}/cancel:
+    post:
+      tags: [Subscriptions]
+      operationId: cancelSubscription
+      summary: Cancel an active or past-due subscription
+      parameters:
+        - $ref: "#/components/parameters/SubscriptionId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelSubscriptionRequest"
+      responses:
+        "200":
+          description: Subscription canceled immediately or scheduled for cancellation at period end
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdempotencyConflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /invoices/{invoice_id}/refund:
+    post:
+      tags: [Invoices]
+      operationId: refundInvoice
+      summary: Process a full or partial refund for a paid invoice
+      parameters:
+        - $ref: "#/components/parameters/InvoiceId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefundInvoiceRequest"
+      responses:
+        "200":
+          description: Refund processed and invoice updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InvoiceResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/IdempotencyConflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+webhooks:
+  subscriptionLifecycleEvent:
+    post:
+      tags: [Webhooks]
+      operationId: onSubscriptionLifecycleEvent
+      summary: Outbound event notification delivered to Merchant Backend
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 signature calculated over the raw request payload
+          schema:
+            type: string
+            example: "t=1731410400,v1=9b3df9804b90123...45ac"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEventPayload"
+      responses:
+        "200":
+          description: Event successfully acknowledged by Merchant Backend
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique UUID v4 token to guarantee exactly-once processing (TTL 24 hours)
+      schema:
+        type: string
+        format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+    SubscriptionId:
+      name: subscription_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    InvoiceId:
+      name: invoice_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    SubscriptionStatus:
+      type: string
+      enum: [TRIALING, ACTIVE, PAST_DUE, SUSPENDED, CANCELED]
+      example: "ACTIVE"
+
+    InvoiceStatus:
+      type: string
+      enum: [DRAFT, OPEN, PAID, PARTIALLY_REFUNDED, PAST_DUE, VOID, REFUNDED]
+      example: "PAID"
+
+    CurrencyCode:
+      type: string
+      pattern: "^[A-Z]{3}$"
+      enum: [RUB, KZT, USD]
+      example: "RUB"
+
+    BillingInterval:
+      type: string
+      enum: [MONTHLY, YEARLY, WEEKLY]
+      example: "MONTHLY"
+
+    CreateSubscriptionRequest:
+      type: object
+      required:
+        - customer_id
+        - plan_id
+        - payment_method_id
+      properties:
+        customer_id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+        payment_method_id:
+          type: string
+          format: uuid
+        trial_days_override:
+          type: [integer, "null"]
+          minimum: 0
+          maximum: 365
+
+    CancelSubscriptionRequest:
+      type: object
+      required:
+        - cancel_at_period_end
+      properties:
+        cancel_at_period_end:
+          type: boolean
+          description: |
+            If true, subscription remains ACTIVE until current_period_end (Self-serve cancel).
+            If false, subscription transitions to CANCELED immediately (Support cancel).
+        cancellation_reason:
+          type: [string, "null"]
+          maxLength: 500
+
+    SubscriptionResponse:
+      type: object
+      required:
+        - id
+        - customer_id
+        - plan_id
+        - payment_method_id
+        - status
+        - anchor_day
+        - current_period_start
+        - current_period_end
+        - cancel_at_period_end
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        customer_id:
+          type: string
+          format: uuid
+        plan_id:
+          type: string
+          format: uuid
+        payment_method_id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/SubscriptionStatus"
+        anchor_day:
+          type: integer
+          minimum: 1
+          maximum: 31
+          description: Billing anchor day of month (1..31) used to restore billing date after short months (BR-01)
+          example: 31
+        current_period_start:
+          type: string
+          format: date-time
+        current_period_end:
+          type: string
+          format: date-time
+        next_billing_at:
+          type: [string, "null"]
+          format: date-time
+        grace_period_ends_at:
+          type: [string, "null"]
+          format: date-time
+        cancel_at_period_end:
+          type: boolean
+        version:
+          type: integer
+          minimum: 1
+          description: Optimistic locking version counter
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    RefundInvoiceRequest:
+      type: object
+      required:
+        - amount_minor
+        - reason
+      properties:
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Refund amount in minor currency units (kopecks/cents)
+          example: 50000
+        reason:
+          type: string
+          maxLength: 255
+          example: "Customer requested partial refund per support agreement"
+
+    InvoiceResponse:
+      type: object
+      required:
+        - id
+        - subscription_id
+        - amount_minor
+        - amount_refunded_minor
+        - currency
+        - status
+        - attempt_count
+        - due_at
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        subscription_id:
+          type: string
+          format: uuid
+        amount_minor:
+          type: integer
+          format: int64
+          description: Total invoice amount in minor units
+          example: 29990
+        amount_refunded_minor:
+          type: integer
+          format: int64
+          description: Cumulative refund amount in minor units
+          example: 0
+        currency:
+          $ref: "#/components/schemas/CurrencyCode"
+        status:
+          $ref: "#/components/schemas/InvoiceStatus"
+        attempt_count:
+          type: integer
+          minimum: 0
+        due_at:
+          type: string
+          format: date-time
+        paid_at:
+          type: [string, "null"]
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    WebhookEventPayload:
+      type: object
+      required:
+        - id
+        - event_type
+        - aggregate_id
+        - created_at
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum:
+            - subscription.created
+            - subscription.active
+            - subscription.past_due
+            - subscription.suspended
+            - subscription.canceled
+            - invoice.paid
+            - invoice.payment_failed
+            - invoice.refunded
+          example: "invoice.paid"
+        aggregate_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          additionalProperties: true
+
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://api.billing.company.internal/errors/insufficient-funds"
+        title:
+          type: string
+          example: "Payment Declined"
+        status:
+          type: integer
+          example: 402
+        detail:
+          type: string
+          example: "The bank declined the transaction due to insufficient funds."
+        error_code:
+          type: string
+          example: "INSUFFICIENT_FUNDS"
+        trace_id:
+          type: string
+          example: "trace-98a0f983bc12"
+
+  responses:
+    BadRequest:
+      description: Invalid request syntax, parameters or schema validation failed
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    PaymentFailed:
+      description: Card charge declined by the payment provider (Soft/Hard decline)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotFound:
+      description: The requested resource was not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    IdempotencyConflict:
+      description: The Idempotency-Key is currently in-flight or was reused with mismatched payload
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    UnprocessableEntity:
+      description: Domain rule violation (e.g. refund amount exceeds paid balance or invalid state transition)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

@@ -1,0 +1,376 @@
+openapi: 3.1.0
+info:
+  title: "room_booking — Core Service API Specification"
+  version: 1.0.0
+  summary: REST API & Webhooks contract generated and verified by SA-Spec-Pipeline.
+  description: |
+    Спецификация OpenAPI 3.1.0 для сервиса бронирования переговорных комнат и коворкинг-зон (Smart Room Booking).
+    Все эндпоинты, схемы, типы данных и статусы строго соответствуют архитектуре и ERD в `02_Architecture.md`.
+servers:
+  - url: https://api.example.com/v1
+    description: Production API Server
+  - url: https://sandbox.api.example.com/v1
+    description: Sandbox / Staging API Server
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Bookings
+    description: Управление жизненным циклом бронирований переговорных комнат
+  - name: CheckIns
+    description: Подтверждение присутствия и Check-in по QR-коду или Wi-Fi
+  - name: Webhooks
+    description: Асинхронные исходящие уведомления и события домена
+
+paths:
+  /bookings:
+    post:
+      tags: [Bookings]
+      operationId: createBooking
+      summary: Создать новое бронирование переговорной комнаты
+      description: |
+        Создает бронирование с учетом лимитов (макс. 2 часа, 14 дней вперед для обычных комнат, проверка VIP L8+ прав, исключение Double Booking через GIST constraint).
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBookingRequest"
+      responses:
+        "201":
+          description: Бронирование успешно создано (статус PENDING_CHECKIN)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /bookings/{booking_id}:
+    get:
+      tags: [Bookings]
+      operationId: getBookingById
+      summary: Получить детальную информацию о бронировании по ID
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+      responses:
+        "200":
+          description: Информация о бронировании успешно получена
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /bookings/{booking_id}/cancel:
+    post:
+      tags: [Bookings]
+      operationId: cancelBooking
+      summary: Отменить существующее бронирование
+      parameters:
+        - $ref: "#/components/parameters/BookingId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelBookingRequest"
+      responses:
+        "200":
+          description: Бронирование успешно отменено
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookingResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /check-ins:
+    post:
+      tags: [CheckIns]
+      operationId: performCheckIn
+      summary: Выполнить Check-in для бронирования
+      description: |
+        Подтверждает присутствие организатора встречи в течение 15 минут через сканирование динамического QR-кода на планшете или валидацию корпоративного Wi-Fi.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCheckInRequest"
+      responses:
+        "201":
+          description: Check-in успешно выполнен, статус брони переведен в CONFIRMED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckInResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+webhooks:
+  domainResourceEvent:
+    post:
+      tags: [Webhooks]
+      operationId: onDomainResourceEvent
+      summary: Исходящий вебхук для уведомления о событиях жизненного цикла бронирований
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 подпись тела запроса для верификации
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEventPayload"
+      responses:
+        "200":
+          description: Вебхук успешно получен и обработан консьюмером
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Уникальный ключ UUID v4 для обеспечения идемпотентности операций (TTL 24 часа)
+      schema:
+        type: string
+        format: uuid
+    BookingId:
+      name: booking_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    BookingStatus:
+      type: string
+      description: Статусы бронирования согласно State Machine в 02_Architecture.md
+      enum: [PENDING_CHECKIN, CONFIRMED, CANCELED, NO_SHOW, COMPLETED]
+
+    CheckInMethod:
+      type: string
+      description: Способ верификации Check-in
+      enum: [QR_CODE, WIFI]
+
+    CreateBookingRequest:
+      type: object
+      required: [room_id, employee_id, title, start_at, end_at]
+      properties:
+        room_id:
+          type: string
+          format: uuid
+          description: Идентификатор переговорной комнаты
+        employee_id:
+          type: string
+          format: uuid
+          description: Идентификатор сотрудника-организатора
+        title:
+          type: string
+          maxLength: 255
+          description: Тема встречи
+        start_at:
+          type: string
+          format: date-time
+          description: Дата и время начала встречи (с таймзоной UTC)
+        end_at:
+          type: string
+          format: date-time
+          description: Дата и время окончания встречи (с таймзоной UTC)
+        is_recurring:
+          type: boolean
+          default: false
+          description: Признак рекуррентного бронирования (в MVP запрещено, всегда false)
+
+    CancelBookingRequest:
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+          description: Причина отмены бронирования
+        immediate:
+          type: boolean
+          default: true
+          description: Немедленное освобождение комнаты
+
+    CreateCheckInRequest:
+      type: object
+      required: [booking_id, employee_id, method]
+      properties:
+        booking_id:
+          type: string
+          format: uuid
+          description: Идентификатор бронирования
+        employee_id:
+          type: string
+          format: uuid
+          description: Идентификатор сотрудника, выполняющего Check-in
+        method:
+          $ref: "#/components/schemas/CheckInMethod"
+
+    BookingResponse:
+      type: object
+      required:
+        - id
+        - room_id
+        - employee_id
+        - title
+        - start_at
+        - end_at
+        - status
+        - is_recurring
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        room_id:
+          type: string
+          format: uuid
+        employee_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        start_at:
+          type: string
+          format: date-time
+        end_at:
+          type: string
+          format: date-time
+        status:
+          $ref: "#/components/schemas/BookingStatus"
+        is_recurring:
+          type: boolean
+        version:
+          type: integer
+          minimum: 1
+          description: Версия оптимистичной блокировки
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CheckInResponse:
+      type: object
+      required:
+        - id
+        - booking_id
+        - method
+        - checked_in_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        booking_id:
+          type: string
+          format: uuid
+        method:
+          $ref: "#/components/schemas/CheckInMethod"
+        checked_in_at:
+          type: string
+          format: date-time
+
+    WebhookEventPayload:
+      type: object
+      required: [id, event_type, aggregate_id, created_at, data]
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          description: Тип доменного события (например, BOOKING_CREATED, BOOKING_CANCELED, BOOKING_NO_SHOW)
+        aggregate_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          additionalProperties: true
+
+    ProblemDetails:
+      type: object
+      required: [type, title, status, detail]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        error_code:
+          type: string
+        trace_id:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Некорректный синтаксис запроса или ошибка валидации полей
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotFound:
+      description: Запрашиваемый ресурс не найден
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    Conflict:
+      description: Конфликт идемпотентности, одновременной модификации или пересечения слотов (Double Booking)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    UnprocessableEntity:
+      description: Нарушение бизнес-правил (BR-*) или недопустимый переход статуса в State Machine
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

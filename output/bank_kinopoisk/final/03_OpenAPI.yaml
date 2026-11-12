@@ -1,0 +1,613 @@
+openapi: 3.1.0
+info:
+  title: "FinTech × Media Ecosystem (Bank + Kinopoisk) — Core API Specification"
+  version: 1.0.0
+  summary: REST API & Webhooks contract for Ecosystem Consent, Spend-Based Subscription Bundle, and Saga Hybrid TVOD Payments.
+  description: |
+    Verified OpenAPI 3.1.0 specification audited by **SA-Spec-Pipeline** (Orchestrator: Gemini 4 Argon).
+    All resource endpoints, schemas, data types (`int64` minor units), and status enums strictly match
+    the ERD and Saga State Machine in `02_Architecture.md`.
+servers:
+  - url: https://api.ecosystem.company.internal/v1
+    description: Production Ecosystem Integration Gateway
+  - url: https://sandbox.api.ecosystem.company.internal/v1
+    description: Staging / Sandbox Environment
+
+security:
+  - BearerAuth: []
+
+tags:
+  - name: Consents
+    description: Customer consent management for cross-domain Bank & Kinopoisk data sharing (152-FZ / FZ-395-1)
+  - name: Subscriptions
+    description: Spend-based subscription bundle projection and turnover progress updates
+  - name: HybridPayments
+    description: Orchestrated Saga payments for TVOD movies using Bank Loyalty Points + Rubles
+  - name: Webhooks
+    description: Outbound signed asynchronous events for Kinopoisk Billing and Bank Processing
+
+paths:
+  /consents:
+    post:
+      tags: [Consents]
+      operationId: upsertUserConsent
+      summary: Grant or revoke ecosystem data-sharing consent (FR-01)
+      description: |
+        Records explicit customer consent (`GRANTED` or `REVOKED`) required by Federal Law 395-1 (Article 26)
+        and 152-FZ to link Bank spend eligibility with the Kinopoisk account.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpsertConsentRequest"
+      responses:
+        "200":
+          description: Consent state updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserConsentResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /subscriptions/{ecosystem_user_id}:
+    get:
+      tags: [Subscriptions]
+      operationId: getSubscriptionState
+      summary: Get cached subscription bundle status and spend progress (FR-02, Prime-Time Read)
+      description: |
+        High-throughput read endpoint (`p95 < 100ms`) serving the local CQRS projection without querying
+        Core Banking ABS synchronously.
+      parameters:
+        - $ref: "#/components/parameters/EcosystemUserId"
+      responses:
+        "200":
+          description: Current subscription bundle projection and loyalty points balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionStateResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+    put:
+      tags: [Subscriptions]
+      operationId: updateSubscriptionState
+      summary: Update qualified card turnover and recalculate bundle eligibility (FR-03, BR-01, BR-02)
+      description: |
+        Invoked by the Bank Processing integration worker when qualified POS spend or merchant refunds occur.
+        Applies MCC filtering (`BR-01`) and post-renewal refund clawback logic (`BR-02`).
+      parameters:
+        - $ref: "#/components/parameters/EcosystemUserId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateSubscriptionStateRequest"
+      responses:
+        "200":
+          description: Subscription projection updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionStateResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /hybrid-payments:
+    post:
+      tags: [HybridPayments]
+      operationId: createHybridPaymentSession
+      summary: Purchase TVOD movie using Hybrid Saga Payment (Loyalty Points + Rubles) (FR-04..FR-06)
+      description: |
+        Executes the two-phase Saga orchestration:
+        1. Validates active `USER_CONSENT`, split rules (`BR-03`: max 99% points, min 1.00 RUB money), and Smart TV `parent_pin_code` (`BR-05`).
+        2. Holds loyalty points (`POINTS_HELD`).
+        3. Debits money from the linked Bank card (`FUNDS_DEBITED`).
+        4. Commits points and grants movie entitlement (`COMMITTED`), or compensates (`COMPENSATED`) on failure.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateHybridPaymentRequest"
+      responses:
+        "201":
+          description: Hybrid payment committed and movie entitlement granted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "202":
+          description: Payment Gateway timed out; session is in RECONCILING state (BR-04)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /hybrid-payments/{payment_id}:
+    get:
+      tags: [HybridPayments]
+      operationId: getHybridPaymentById
+      summary: Retrieve hybrid payment Saga session status by ID
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+      responses:
+        "200":
+          description: Hybrid payment session details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /hybrid-payments/{payment_id}/compensate:
+    post:
+      tags: [HybridPayments]
+      operationId: compensateHybridPayment
+      summary: Trigger manual or reconciliation-driven Saga compensation (refund/release)
+      parameters:
+        - $ref: "#/components/parameters/PaymentId"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompensateHybridPaymentRequest"
+      responses:
+        "200":
+          description: Saga session compensated and points/funds restored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HybridPaymentSessionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+webhooks:
+  ecosystemDomainEvent:
+    post:
+      tags: [Webhooks]
+      operationId: onEcosystemDomainEvent
+      summary: Outbound signed webhook event for Kinopoisk Billing and Entitlement consumers
+      parameters:
+        - name: X-Webhook-Signature
+          in: header
+          required: true
+          description: HMAC-SHA256 signature of the raw JSON request body
+          schema:
+            type: string
+            example: "t=1762948800,v1=3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookEventPayload"
+      responses:
+        "200":
+          description: Webhook acknowledged by downstream service
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique UUID v4 key to guarantee idempotent execution (TTL 24h)
+      schema:
+        type: string
+        format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+    EcosystemUserId:
+      name: ecosystem_user_id
+      in: path
+      required: true
+      description: Unified SSO identifier of the ecosystem customer
+      schema:
+        type: string
+        minLength: 3
+        maxLength: 128
+        example: "eco_usr_99887766"
+    PaymentId:
+      name: payment_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    ConsentStatus:
+      type: string
+      enum: [GRANTED, REVOKED]
+      example: "GRANTED"
+
+    SubscriptionBundleStatus:
+      type: string
+      description: Must match SUBSCRIPTION_STATE.subscription_status in 02_Architecture.md ERD
+      enum: [FREE_BUNDLE, PAID_399, GRACE_PERIOD, CLAWBACK_DEBT, EXPIRED]
+      example: "FREE_BUNDLE"
+
+    HybridPaymentStatus:
+      type: string
+      description: Must match HYBRID_PAYMENT_SESSION.status and Saga State Machine in 02_Architecture.md
+      enum: [INITIATED, POINTS_HELD, FUNDS_DEBITED, RECONCILING, COMMITTED, COMPENSATED, FAILED]
+      example: "COMMITTED"
+
+    DeviceType:
+      type: string
+      enum: [SMART_TV, MOBILE, WEB]
+      example: "SMART_TV"
+
+    UpsertConsentRequest:
+      type: object
+      required:
+        - ecosystem_user_id
+        - consent_version
+        - status
+      properties:
+        ecosystem_user_id:
+          type: string
+          example: "eco_usr_99887766"
+        consent_version:
+          type: string
+          example: "v1.0-fz395-152fz"
+        status:
+          $ref: "#/components/schemas/ConsentStatus"
+
+    UserConsentResponse:
+      type: object
+      required:
+        - id
+        - ecosystem_user_id
+        - consent_version
+        - status
+        - granted_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        ecosystem_user_id:
+          type: string
+        consent_version:
+          type: string
+        status:
+          $ref: "#/components/schemas/ConsentStatus"
+        granted_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+
+    UpdateSubscriptionStateRequest:
+      type: object
+      required:
+        - qualified_turnover_minor
+        - loyalty_points_minor
+        - is_refund_event
+        - period_start
+        - period_end
+      properties:
+        qualified_turnover_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Qualified POS card turnover in kopecks (target is 1500000 = 15,000.00 RUB)
+          example: 1650000
+        loyalty_points_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Available Bank cashback points in minor units (1 point = 100 minor units)
+          example: 45000
+        is_refund_event:
+          type: boolean
+          default: false
+          description: True if triggered by a merchant refund/storno transaction (checks BR-02 clawback)
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+
+    SubscriptionStateResponse:
+      type: object
+      required:
+        - id
+        - ecosystem_user_id
+        - subscription_status
+        - qualified_turnover_minor
+        - loyalty_points_minor
+        - spend_target_met
+        - turnover_progress_pct
+        - next_renewal_price_minor
+        - period_start
+        - period_end
+        - version
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        ecosystem_user_id:
+          type: string
+        subscription_status:
+          $ref: "#/components/schemas/SubscriptionBundleStatus"
+        qualified_turnover_minor:
+          type: integer
+          format: int64
+          example: 1650000
+        loyalty_points_minor:
+          type: integer
+          format: int64
+          example: 45000
+        spend_target_met:
+          type: boolean
+          example: true
+        turnover_progress_pct:
+          type: integer
+          minimum: 0
+          maximum: 100
+          example: 100
+        next_renewal_price_minor:
+          type: integer
+          format: int64
+          description: 0 kopecks when spend_target_met is true, otherwise 39900 kopecks (399.00 RUB)
+          example: 0
+        period_start:
+          type: string
+          format: date-time
+        period_end:
+          type: string
+          format: date-time
+        version:
+          type: integer
+          minimum: 1
+        updated_at:
+          type: string
+          format: date-time
+
+    CreateHybridPaymentRequest:
+      type: object
+      required:
+        - ecosystem_user_id
+        - item_id
+        - device_type
+        - is_kids_profile
+        - total_amount_minor
+        - paid_points_minor
+        - paid_money_minor
+      properties:
+        ecosystem_user_id:
+          type: string
+          example: "eco_usr_99887766"
+        item_id:
+          type: string
+          format: uuid
+        device_type:
+          $ref: "#/components/schemas/DeviceType"
+        is_kids_profile:
+          type: boolean
+          default: false
+        total_amount_minor:
+          type: integer
+          format: int64
+          minimum: 100
+          description: Total TVOD movie price in kopecks (e.g., 59900 = 599.00 RUB)
+          example: 59900
+        paid_points_minor:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Loyalty points to deduct in minor units (max 99% of total_amount_minor per BR-03)
+          example: 30000
+        paid_money_minor:
+          type: integer
+          format: int64
+          minimum: 100
+          description: Rubles to charge from linked Bank card in kopecks (min 100 kopecks = 1.00 RUB per BR-03)
+          example: 29900
+        parent_pin_code:
+          type: [string, "null"]
+          pattern: "^[0-9]{4}$"
+          description: Write-only 4-digit Parental PIN required on SMART_TV when total_amount_minor > 30000 or is_kids_profile is true (BR-05)
+          example: "4815"
+
+    CompensateHybridPaymentRequest:
+      type: object
+      required:
+        - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+          example: "Bank gateway reconciliation confirmed debit failure"
+
+    HybridPaymentSessionResponse:
+      type: object
+      required:
+        - id
+        - ecosystem_user_id
+        - item_id
+        - device_type
+        - is_kids_profile
+        - total_amount_minor
+        - paid_points_minor
+        - paid_money_minor
+        - status
+        - entitlement_granted
+        - version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        ecosystem_user_id:
+          type: string
+        item_id:
+          type: string
+          format: uuid
+        device_type:
+          $ref: "#/components/schemas/DeviceType"
+        is_kids_profile:
+          type: boolean
+        total_amount_minor:
+          type: integer
+          format: int64
+        paid_points_minor:
+          type: integer
+          format: int64
+        paid_money_minor:
+          type: integer
+          format: int64
+        status:
+          $ref: "#/components/schemas/HybridPaymentStatus"
+        entitlement_granted:
+          type: boolean
+        failure_reason:
+          type: [string, "null"]
+        version:
+          type: integer
+          minimum: 1
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    WebhookEventPayload:
+      type: object
+      required:
+        - id
+        - event_type
+        - aggregate_id
+        - created_at
+        - data
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum:
+            - consent.updated
+            - subscription.status_changed
+            - payment.committed
+            - payment.compensated
+          example: "payment.committed"
+        aggregate_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        data:
+          type: object
+          additionalProperties: true
+
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+      properties:
+        type:
+          type: string
+          format: uri
+          example: "https://api.ecosystem.company.internal/errors/max-points-limit-exceeded"
+        title:
+          type: string
+          example: "Business Rule Violation"
+        status:
+          type: integer
+          example: 422
+        detail:
+          type: string
+          example: "Loyalty points cannot exceed 99% of the total item price; minimum 1.00 RUB card payment required."
+        error_code:
+          type: string
+          enum:
+            - IDEMPOTENCY_IN_FLIGHT
+            - OPTIMISTIC_LOCK_CONFLICT
+            - CONSENT_REQUIRED
+            - INVALID_PAYMENT_SPLIT
+            - MAX_POINTS_LIMIT_EXCEEDED
+            - INSUFFICIENT_LOYALTY_POINTS
+            - BANK_DEBIT_DECLINED
+            - PARENTAL_PIN_REQUIRED
+            - INVALID_PARENTAL_PIN
+            - PARENTAL_PIN_LOCKED
+            - INVALID_STATE_TRANSITION
+          example: "MAX_POINTS_LIMIT_EXCEEDED"
+        trace_id:
+          type: string
+          example: "trace-4920a18f7c33"
+
+  responses:
+    BadRequest:
+      description: Malformed request syntax or invalid parameter format
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    NotFound:
+      description: Requested user projection or payment session was not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    Conflict:
+      description: Idempotency-Key conflict or concurrent modification (Optimistic Lock failure)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    UnprocessableEntity:
+      description: Domain rule violation (BR-01..BR-05), missing consent, or declined bank debit
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
